@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ちっちAI (修正版)</title>
+    <!-- MediaPipe -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <style>
+        body { font-family: sans-serif; background: #000; color: white; margin: 0; overflow: hidden; user-select: none; }
+        #container { position: relative; width: 100vw; height: 100vh; cursor: pointer; }
+        
+        video { display: none; }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+
+        /* UIレイヤー */
+        #ui-layer { position: absolute; z-index: 10; width: 100%; height: 100%; pointer-events: none; }
+        
+        /* ステータス表示 */
+        .status-bar {
+            position: absolute; top: 10px; left: 10px; right: 10px;
+            display: flex; justify-content: space-between;
+            font-size: 1.2rem; font-weight: bold; text-shadow: 2px 2px 2px #000;
+        }
+        .mic-active { color: #0f0; }
+        .mic-inactive { color: #f00; }
+
+        /* 中央情報 */
+        .center-msg {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            text-align: center; width: 100%;
+            text-shadow: 0 0 10px #000;
+        }
+        #target-char { font-size: 12rem; font-weight: bold; color: #fff; display: none; }
+        #instruction { font-size: 2rem; color: #ffeb3b; }
+        #judge-res { font-size: 3rem; margin-top: 20px; font-weight: bold; opacity: 0; transition: 0.3s; }
+
+        /* 開始誘導オーバーレイ */
+        #click-starter {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.8); z-index: 999;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 2rem; color: white;
+            transition: opacity 0.5s;
+            cursor: pointer;
+            pointer-events: auto; /* クリックを受け付ける */
+        }
+    </style>
+</head>
+<body>
+
+<div id="container">
+    <video id="input_video"></video>
+    <canvas id="output_canvas"></canvas>
+
+    <!-- 最初のクリック用オーバーレイ -->
+    <div id="click-starter">
+        <div style="text-align:center;">
+            画面をタップしてスタート<br>
+            <span style="font-size:1rem; color:#aaa;">(マイクとカメラの許可が必要です)</span>
+        </div>
+    </div>
+
+    <div id="ui-layer">
+        <div class="status-bar">
+            <div id="row-display">行: 未定</div>
+            <div id="mic-status" class="mic-inactive">マイク準備中...</div>
+        </div>
+
+        <div class="center-msg">
+            <div id="instruction">「ちっちの〇〇」と言ってください</div>
+            <div id="target-char">？</div>
+            <div id="judge-res">判定結果</div>
+        </div>
+    </div>
+</div>
+
+<script>
+    // --- グローバル変数 ---
+    const hiraganaTable = {
+        "あ": ["あ", "い", "う", "え", "お"], "か": ["か", "き", "く", "け", "こ"],
+        "さ": ["さ", "し", "す", "せ", "そ"], "た": ["た", "ち", "つ", "て", "と"],
+        "な": ["な", "に", "ぬ", "ね", "の"], "は": ["は", "ひ", "ふ", "へ", "ほ"],
+        "ま": ["ま", "み", "む", "め", "も"], "や": ["や", "い", "ゆ", "え", "よ"],
+        "ら": ["ら", "り", "る", "れ", "ろ"], "わ": ["わ", "い", "う", "え", "を"],
+        "が": ["が", "ぎ", "ぐ", "げ", "ご"], "ざ": ["ざ", "じ", "ず", "ぜ", "ぞ"],
+        "だ": ["だ", "ぢ", "づ", "で", "ど"], "ば": ["ば", "び", "ぶ", "べ", "ぼ"],
+        "ぱ": ["ぱ", "ぴ", "ぷ", "ぺ", "ぽ"]
+    };
+    let currentRow = null;
+    let currentTarget = null;
+    let recognition;
+    let isStarted = false;
+
+    // --- イベントリスナー設定 ---
+    // 注意: window.onloadでの自動起動は削除しました（ブラウザ制限回避のため）
+
+    // スタートボタン（オーバーレイ）のクリックイベント
+    document.getElementById('click-starter').addEventListener('click', async function() {
+        if (isStarted) return;
+        
+        // ユーザーインタラクション内で処理を開始
+        try {
+            await startMicrophone(); // マイク許可
+            startCamera();           // カメラ起動
+            
+            // 成功したらUI更新
+            isStarted = true;
+            const overlay = document.getElementById('click-starter');
+            overlay.style.opacity = 0;
+            setTimeout(() => overlay.style.display = 'none', 500);
+
+        } catch (e) {
+            console.error(e);
+            alert("起動エラー: マイクまたはカメラの許可を確認してください。\n" + e.message);
+        }
+    });
+
+    // --- マイク処理 ---
+    async function startMicrophone() {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            throw new Error("このブラウザは音声認識に対応していません。Google Chromeを使用してください。");
+        }
+
+        // 1. まずgetUserMediaで明示的に許可を取る
+        // これによりブラウザの許可ポップアップが確実に出ます
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            // 【重要】許可だけ取ったらストリームは一旦停止・解放する
+            // 解放しないとSpeechRecognitionとマイクを取り合ってエラーになることがあります
+            stream.getTracks().forEach(track => track.stop());
+        } catch (e) {
+            throw new Error("マイクの許可が拒否されました。");
+        }
+
+        // 2. 音声認識APIのセットアップ
+        recognition = new SpeechRecognition();
+        recognition.lang = 'ja-JP';
+        recognition.continuous = true; 
+        recognition.interimResults = false;
+
+        recognition.onstart = () => {
+            const el = document.getElementById('mic-status');
+            el.innerText = "マイクON 🎤";
+            el.className = "mic-active";
+        };
+
+        recognition.onend = () => {
+            console.log("マイク停止 -> 再接続試行");
+            // 意図せず切れた場合は再開
+            if (isStarted) {
+                try { recognition.start(); } catch(e){}
+            }
+        };
+
+        recognition.onerror = (e) => {
+            console.error("Mic Error", e);
+            const el = document.getElementById('mic-status');
+            if(e.error === 'not-allowed') {
+                el.innerText = "マイク許可エラー";
+                el.className = "mic-inactive";
+            }
+        };
+
+        recognition.onresult = handleSpeechResult;
+
+        // 3. 認識開始
+        recognition.start();
+    }
+
+    // --- 音声コマンド処理 ---
+    async function handleSpeechResult(event) {
+        const text = event.results[event.results.length - 1][0].transcript.trim();
+        console.log("認識:", text);
+
+        // 1. 行決め
+        if (text.includes("ちっちの") || text.includes("チッチの")) {
+            let char = text.replace(/.*(ちっち|チッチ)の/, "").trim().charAt(0);
+            // カタカナ→ひらがな変換
+            char = char.replace(/[\u30a1-\u30f6]/g, m => String.fromCharCode(m.charCodeAt(0) - 0x60));
+            
+            if (hiraganaTable[char]) {
+                currentRow = char;
+                document.getElementById('row-display').innerText = `行: ${char}`;
+                document.getElementById('instruction').style.display = 'none';
+                document.getElementById('target-char').style.display = 'none';
+                document.getElementById('judge-res').style.opacity = 0;
+                currentTarget = null; // リセット
+                updateGameDisplay(); // 画面更新
+            }
+        } 
+        // 2. 判定 (ターゲット文字が決まっている場合)
+        else if (currentTarget) {
+            const hiraText = text.replace(/[\u30a1-\u30f6]/g, m => String.fromCharCode(m.charCodeAt(0) - 0x60));
+            const isValidStart = hiraText.startsWith(currentTarget);
+            
+            const resEl = document.getElementById('judge-res');
+            resEl.style.opacity = 1;
+
+            if (isValidStart) {
+                const exists = await checkWiki(text);
+                if (exists) {
+                    resEl.innerText = `⭕ ${text}`;
+                    resEl.style.color = "#0f0";
+                } else {
+                    resEl.innerText = `❓ 辞書なし ${text}`;
+                    resEl.style.color = "yellow";
+                }
+            } else {
+                resEl.innerText = `❌ ${text} (正解: ${currentTarget}...)`;
+                resEl.style.color = "red";
+            }
+            setTimeout(() => resEl.style.opacity = 0, 3000);
+        }
+    }
+
+    async function checkWiki(word) {
+        try {
+            const r = await fetch(`https://ja.wikipedia.org/w/api.php?origin=*&format=json&action=query&titles=${word}`);
+            const d = await r.json();
+            return !d.query.pages["-1"];
+        } catch { return true; }
+    }
+
+    // --- カメラ＆画像認識 ---
+    function startCamera() {
+        const video = document.getElementById('input_video');
+        const canvas = document.getElementById('output_canvas');
+        const ctx = canvas.getContext('2d');
+
+        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+        hands.setOptions({
+            maxNumHands: 4, // 4本の手
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        let lastTotal = -1;
+
+        hands.onResults((results) => {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            ctx.save();
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+
+            let total = 0;
+            if (results.multiHandLandmarks) {
+                for (const landmarks of results.multiHandLandmarks) {
+                    // 指カウント
+                    let f = 0;
+                    // 指4本
+                    [[8,6,5], [12,10,9], [16,14,13], [20,18,17]].forEach(idx => {
+                        const [tip, pip, mcp] = idx;
+                        const dTip = Math.hypot(landmarks[tip].x - landmarks[pip].x, landmarks[tip].y - landmarks[pip].y);
+                        const dBase = Math.hypot(landmarks[pip].x - landmarks[mcp].x, landmarks[pip].y - landmarks[mcp].y);
+                        if (dTip > dBase * 0.7) f++;
+                    });
+                    // 親指
+                    const dThumb = Math.hypot(landmarks[4].x - landmarks[17].x, landmarks[4].y - landmarks[17].y);
+                    const dIp = Math.hypot(landmarks[3].x - landmarks[17].x, landmarks[3].y - landmarks[17].y);
+                    if (dThumb > dIp * 1.1) f++;
+
+                    total += f;
+                    
+                    // 描画
+                    drawConnectors(ctx, landmarks, HAND_CONNECTIONS, {color: f===5?'#0f0':'#fff', lineWidth: 2});
+                    drawLandmarks(ctx, landmarks, {color: '#f00', lineWidth: 1});
+                    
+                    // 数字表示
+                    ctx.fillStyle = "white";
+                    ctx.font = "bold 40px Arial";
+                    ctx.fillText(f, landmarks[0].x * canvas.width, landmarks[0].y * canvas.height);
+                }
+            }
+            ctx.restore();
+
+            // 指の数が変わったときだけ更新処理
+            if (total !== lastTotal) {
+                lastTotal = total;
+                updateGame(total);
+            }
+        });
+
+        const camera = new Camera(video, {
+            onFrame: async () => { await hands.send({image: video}); },
+            width: 1280, height: 720
+        });
+        camera.start();
+    }
+
+    function updateGame(total) {
+        if (!currentRow) return;
+        const targetEl = document.getElementById('target-char');
+        
+        if (total > 0) {
+            targetEl.style.display = 'block';
+            document.getElementById('instruction').style.display = 'none';
+            
+            // 1~5本を配列インデックス0~4にマッピング
+            // (合計が6以上になってもループするように修正)
+            let idx = (total - 1);
+            if (idx >= 5) idx = idx % 5;
+            if (idx < 0) idx = 0;
+
+            const char = hiraganaTable[currentRow][idx];
+            
+            targetEl.innerText = char;
+            currentTarget = char;
+        } else {
+            // 0本の時は隠す
+            targetEl.style.display = 'none';
+            currentTarget = null;
+        }
+    }
+
+    function updateGameDisplay() {
+        // リセット時などの表示更新用ヘルパー
+        const targetEl = document.getElementById('target-char');
+        if (!currentTarget) {
+            targetEl.style.display = 'none';
+        }
+    }
+</script>
+</body>
+</html>
